@@ -8,6 +8,7 @@ const TARGET = new URL('https://preview-p22655-e59433.adobeaemcloud.com/');
 const PORT = process.env.PORT || 3000;
 const SSL_CERT = process.env.SSL_CERT;
 const SSL_KEY = process.env.SSL_KEY;
+const ACCESS_TOKEN = process.env.ACCESS_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const CLIENT_SECRET = process.env.CLIENT_SECRET;
 const SCOPES = process.env.SCOPES;
@@ -19,8 +20,8 @@ if (!SSL_CERT || !SSL_KEY) {
   console.error('SSL_CERT and SSL_KEY environment variables are required (paths to PEM files)');
   process.exit(1);
 }
-if (!CLIENT_ID || !CLIENT_SECRET || !SCOPES) {
-  console.error('CLIENT_ID, CLIENT_SECRET, and SCOPES environment variables are required');
+if (!ACCESS_TOKEN && (!CLIENT_ID || !CLIENT_SECRET || !SCOPES)) {
+  console.error('Provide ACCESS_TOKEN, or CLIENT_ID + CLIENT_SECRET + SCOPES for OAuth mint');
   process.exit(1);
 }
 
@@ -141,6 +142,7 @@ async function mintToken() {
 }
 
 async function getToken() {
+  if (ACCESS_TOKEN) return ACCESS_TOKEN;
   if (tokenCache && tokenCache.expiresAt > Date.now()) return tokenCache.token;
   if (!tokenInFlight) {
     log('debug', 'token cache miss, minting');
@@ -313,14 +315,18 @@ function onHandlerError(reqId, res, err) {
 
 log('info', 'starting', {
   target: TARGET.origin, port: PORT, sslCert: SSL_CERT, sslKey: SSL_KEY,
-  tokenEndpoint: TOKEN_ENDPOINT, logLevel: LOG_LEVEL, maxCacheEntries: MAX_ENTRIES, maxTtlSec: MAX_TTL_SEC,
+  tokenMode: ACCESS_TOKEN ? 'static' : 'oauth',
+  tokenEndpoint: ACCESS_TOKEN ? undefined : TOKEN_ENDPOINT,
+  logLevel: LOG_LEVEL, maxCacheEntries: MAX_ENTRIES, maxTtlSec: MAX_TTL_SEC,
 });
 
-try {
-  await getToken();
-} catch (err) {
-  log('error', 'initial token mint failed, exiting', { message: err.message });
-  process.exit(1);
+if (!ACCESS_TOKEN) {
+  try {
+    await getToken();
+  } catch (err) {
+    log('error', 'initial token mint failed, exiting', { message: err.message });
+    process.exit(1);
+  }
 }
 
 const server = https.createServer(tlsOptions, (req, res) => {
