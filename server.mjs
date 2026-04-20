@@ -50,6 +50,18 @@ function stripResponseCookies(headers) {
   return out;
 }
 
+// Remove any upstream-provided values for headers we set ourselves,
+// so we don't emit duplicates (e.g. AEM sends its own `x-cache`).
+function dropHeaders(headers, names) {
+  const drop = new Set(names.map((n) => n.toLowerCase()));
+  const out = {};
+  for (const [k, v] of Object.entries(headers)) {
+    if (drop.has(k.toLowerCase())) continue;
+    out[k] = v;
+  }
+  return out;
+}
+
 function shellQuote(s) {
   return `'${String(s).replace(/'/g, `'\\''`)}'`;
 }
@@ -234,14 +246,14 @@ async function handleCacheable(reqId, req, res, ttlSec) {
   }, (proxyRes) => {
     const status = proxyRes.statusCode;
     const hasSetCookie = Boolean(proxyRes.headers['set-cookie']);
-    const cacheable = status >= 200 && status < 300 && !hasSetCookie;
+    const cacheable = status >= 200 && status < 300;
     log('info', 'upstream response', {
       reqId, status, durationMs: Date.now() - upstreamStart,
       contentLength: proxyRes.headers['content-length'], cacheable, hasSetCookie,
     });
 
     if (!cacheable) {
-      res.writeHead(status, { ...stripResponseCookies(proxyRes.headers), 'X-Cache': 'MISS' });
+      res.writeHead(status, { ...dropHeaders(stripResponseCookies(proxyRes.headers), ['x-cache']), 'X-Cache': 'MISS' });
       proxyRes.pipe(res);
       return;
     }
@@ -250,7 +262,7 @@ async function handleCacheable(reqId, req, res, ttlSec) {
     proxyRes.on('data', (chunk) => chunks.push(chunk));
     proxyRes.on('end', () => {
       const body = Buffer.concat(chunks);
-      const cachedHeaders = sanitizeCachedHeaders(proxyRes.headers);
+      const cachedHeaders = dropHeaders(sanitizeCachedHeaders(proxyRes.headers), ['x-cache']);
       storeInCache(key, {
         expiresAt: Date.now() + ttlSec * 1000,
         status,
@@ -294,7 +306,7 @@ async function handleBypass(reqId, req, res) {
       reqId, status: proxyRes.statusCode, durationMs: Date.now() - upstreamStart,
       contentLength: proxyRes.headers['content-length'], cacheable: false,
     });
-    res.writeHead(proxyRes.statusCode, { ...stripResponseCookies(proxyRes.headers), 'X-Cache': 'BYPASS' });
+    res.writeHead(proxyRes.statusCode, { ...dropHeaders(stripResponseCookies(proxyRes.headers), ['x-cache']), 'X-Cache': 'BYPASS' });
     proxyRes.pipe(res);
   });
 
