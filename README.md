@@ -1,31 +1,40 @@
 # mas-freyja-proxy
 
-Minimal HTTPS reverse proxy that fronts the AEM Freyja preview environment
-(`https://preview-p22655-e59433.adobeaemcloud.com/`) for MAS Studio and
-injects an Adobe IMS bearer token server-side, so clients don't have to
-handle IMS credentials.
+Minimal HTTP/2 reverse proxy fronting the AEM Freyja preview environment
+(`https://preview-p22655-e59433.adobeaemcloud.com/`) for MAS Studio. Injects
+an Adobe IMS bearer token server-side so clients don't handle IMS credentials.
 
-Zero runtime dependencies — built on Node's stdlib (`node:http`, `node:https`,
-`node:crypto`) and the built-in `.env` loader (`process.loadEnvFile()`).
+Zero runtime dependencies — Node stdlib only (`node:http2`, `node:https`,
+`node:crypto`, `node:fs`) and the built-in `.env` loader.
 
-## How it's used
+## Modes
 
-Two consumer modes, selected per-request by the `Cache-Control` header the
-caller sends. The proxy itself does not cache response bodies — it sets the
-right `Cache-Control` downstream so the browser does the caching.
+Selected per-request by the caller's `Cache-Control`. The proxy does not
+cache bodies; it sets `Cache-Control` downstream so the browser caches.
 
-| Caller              | Sends                      | Proxy emits downstream |
-| ------------------- | -------------------------- | ---------------------- |
-| Authoring (default) | _no `Cache-Control`_       | `Cache-Control: no-store` |
-| Stage / website     | `Cache-Control: max-age=N` | `Cache-Control: public, max-age=15, stale-while-revalidate=604800, stale-if-error=604800` |
+| Caller              | Sends                      | Proxy emits (on 2xx)                                                          |
+| ------------------- | -------------------------- | ----------------------------------------------------------------------------- |
+| Authoring (default) | _no `Cache-Control`_       | `no-store`                                                                    |
+| Stage / website     | `Cache-Control: max-age=N` | `public, max-age=15, stale-while-revalidate=604800, stale-if-error=604800`    |
 
-The caller's `max-age=N` is a mode signal only — the proxy emits a fixed
-policy (15 s fresh, 7 days stale-while-revalidate) regardless of `N`. The
-browser becomes the real cache.
+`N` is a mode signal only; the emitted policy is fixed (15 s fresh, 7 d SWR).
+Non-2xx responses always get `no-store` so transient upstream errors can't be
+pinned in the browser cache.
 
-Bearer-token injection: the proxy mints tokens via Adobe IMS
-Server-to-Server (`client_credentials` grant) and auto-refreshes before
-expiry, with in-flight coalescing so concurrent requests share one mint.
+## Features
+
+- **HTTP/2** with HTTP/1.1 fallback (`http2.createSecureServer({ allowHTTP1: true })`).
+- **IMS token injection** via `client_credentials` grant, auto-refresh with
+  in-flight coalescing.
+- **CORS always on** — preflight is answered directly by the proxy; every
+  response carries `Access-Control-Allow-*` so upstream errors remain visible.
+- **Keep-alive upstream pool** (`https.Agent({ keepAlive: true, maxSockets: 64 })`)
+  — critical so browser SWR revalidations don't pay a TLS handshake per 304.
+- **Header hygiene**: strips client-scoped request headers (`cookie`,
+  `authorization`, `referer`, `origin`, `sec-ch-ua*`, `sec-fetch-*`, etc.) and
+  hop-by-hop headers per RFC 7230. Drops `Set-Cookie` and upstream
+  `Cache-Control` from responses. Forwards `If-None-Match` / `If-Modified-Since`
+  so browser conditional revalidation works end-to-end.
 
 ## Configuration (`.env`)
 
@@ -39,17 +48,15 @@ expiry, with in-flight coalescing so concurrent requests share one mint.
 | `PORT`           | no       | Listen port (default `3000`).                                  |
 | `TOKEN_ENDPOINT` | no       | Override IMS token endpoint (default `ims-na1` prod).          |
 | `LOG_LEVEL`      | no       | `error` \| `warn` \| `info` \| `debug` (default `debug`).      |
-| `LOG_CURL`       | no       | Log a reproducible `curl` for every upstream call. Default on. |
+| `LOG_CURL`       | no       | Log a reproducible `curl` per upstream call. Default on.       |
 
 ## Running
-
-Local:
 
 ```bash
 node server.mjs
 ```
 
-As a systemd service (production): see [`service.sh`](service.sh) and
+Systemd (production): see [`service.sh`](service.sh) and
 [`deploy/mas-freyja-proxy.service`](deploy/mas-freyja-proxy.service).
 
 ```bash
@@ -60,73 +67,9 @@ As a systemd service (production): see [`service.sh`](service.sh) and
 ./service.sh uninstall
 ```
 
-## Caching strategy
-
-The browser is the cache. The proxy is a thin token-injecting pass-through
-that tells the browser how to cache via response headers.
-
-### Stage mode — `Cache-Control: public, max-age=15, stale-while-revalidate=604800, stale-if-error=604800`
-
-- **`max-age=15`** — browser serves straight from its own cache for 15 s.
-  Zero round trip, zero proxy load.
-- **`stale-while-revalidate=604800`** (7 days) — after those 15 s, for up
-  to a week, the browser still serves the cached body immediately and
-  refetches in the background. The user experiences memory latency; the
-  revalidation happens off the critical path.
-- **`stale-if-error=604800`** — if the background revalidation fails
-  (upstream 5xx), the browser keeps serving stale for up to a week rather
-  than surfacing the error.
-- **ETag / Last-Modified pass through unchanged.** The browser attaches
-  `If-None-Match` / `If-Modified-Since` on revalidation; upstream's `304
-  Not Modified` flows straight back to the browser. Background refreshes
-  are typically a few hundred bytes, not full bodies.
-
-### Authoring / bypass mode — `Cache-Control: no-store`
-
-Nothing caches. Every call reaches upstream fresh.
-
-### Proxy-side optimizations kept
-
-Only the ones the browser can't do for you.
-
-- **Keep-alive connection pool** to upstream
-  (`https.Agent({ keepAlive: true, maxSockets: 64 })`) — shared across
-  every request. Critical: every browser SWR revalidation still traverses
-  the proxy, and paying a TCP+TLS handshake per 304 would dominate.
-- **IMS token mint + in-flight coalescing** — tokens are proxy-local
-  secrets; concurrent requests share a single mint.
-- **`/favicon.ico` → 204** short-circuit, never reaches upstream.
-- **Header hygiene** (see below), still necessary regardless of caching.
-
-### End-to-end latency matrix
-
-| Caller state                               | Layer hit        | Latency          | Network                 |
-| ------------------------------------------ | ---------------- | ---------------- | ----------------------- |
-| Browser cache fresh (< 15 s)               | browser RAM/disk | sub-ms           | none                    |
-| Browser cache stale (within SWR window)    | browser RAM/disk | sub-ms for user  | 1 background request, usually 304 |
-| Browser cache cold (first visit)           | full chain       | 1 RTT to proxy + 1 to AEM | full body once |
-| Authoring / bypass                         | full chain       | 1 RTT (warm sockets)      | full body      |
-
-## Security / header hygiene
-
-- Bearer token injected server-side; never trusted from the client.
-- Client-scoped headers stripped before forwarding upstream: `cookie`,
-  `authorization`, `cache-control`, `pragma`, `referer`, `origin`,
-  `sec-ch-ua*`, `sec-fetch-*`, `upgrade-insecure-requests`, `dnt`,
-  `priority`. Prevents HTTP 431 and avoids leaking caller identity or
-  mode hints to AEM.
-- `If-None-Match` / `If-Modified-Since` are intentionally forwarded so the
-  browser's conditional revalidation reaches upstream unchanged.
-- Hop-by-hop headers dropped per RFC 7230.
-- `Set-Cookie` stripped from upstream responses. Cookies are never logged
-  (fully omitted, not redacted).
-- Upstream's `Cache-Control` is overridden — the proxy, not AEM, decides
-  the browser-facing caching policy.
-
 ## Logging
 
-Structured JSON-ish lines to stdout; routed to `journalctl -u mas-freyja-proxy`
-when run under systemd. Every request gets a short `reqId` threaded through
-all related log lines. Optional `LOG_CURL=true` emits a ready-to-run `curl`
-command for each upstream call (useful for debugging, includes the real
-bearer token — leave off in shared environments).
+Structured lines to stdout; `journalctl -u mas-freyja-proxy` under systemd.
+Every request gets a short `reqId` threaded through its log lines. `LOG_CURL=true`
+emits a ready-to-run `curl` per upstream call — includes the real bearer token,
+leave off in shared environments.
