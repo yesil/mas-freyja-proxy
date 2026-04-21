@@ -229,7 +229,8 @@ async function handleRequest(reqId, req, res, mode) {
     // Override upstream Cache-Control: the proxy, not AEM, decides what the
     // browser should do with these responses. ETag / Last-Modified pass
     // through unchanged so browser conditional revalidation keeps working.
-    const cacheControl = mode === 'stage' ? STAGE_CACHE_CONTROL : BYPASS_CACHE_CONTROL;
+    const is2xx = proxyRes.statusCode >= 200 && proxyRes.statusCode < 300;
+    const cacheControl = mode === 'stage' && is2xx ? STAGE_CACHE_CONTROL : BYPASS_CACHE_CONTROL;
     const outHeaders = dropHeaders(stripResponseCookies(proxyRes.headers), [
       'cache-control', ...HOP_BY_HOP,
     ]);
