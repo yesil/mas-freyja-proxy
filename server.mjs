@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import http2 from 'node:http2';
 import https from 'node:https';
 import { randomBytes } from 'node:crypto';
 
@@ -197,6 +198,7 @@ async function buildUpstreamHeaders(req) {
   const headers = {};
   for (const [k, v] of Object.entries(req.headers)) {
     const lk = k.toLowerCase();
+    if (lk.startsWith(':')) continue;
     if (HOP_BY_HOP.has(lk) || DROP_FROM_UPSTREAM.has(lk)) continue;
     headers[k] = v;
   }
@@ -228,7 +230,9 @@ async function handleRequest(reqId, req, res, mode) {
     // browser should do with these responses. ETag / Last-Modified pass
     // through unchanged so browser conditional revalidation keeps working.
     const cacheControl = mode === 'stage' ? STAGE_CACHE_CONTROL : BYPASS_CACHE_CONTROL;
-    const outHeaders = dropHeaders(stripResponseCookies(proxyRes.headers), ['cache-control']);
+    const outHeaders = dropHeaders(stripResponseCookies(proxyRes.headers), [
+      'cache-control', ...HOP_BY_HOP,
+    ]);
     outHeaders['Cache-Control'] = cacheControl;
     res.writeHead(proxyRes.statusCode, outHeaders);
     proxyRes.pipe(res);
@@ -262,7 +266,7 @@ try {
   process.exit(1);
 }
 
-const server = https.createServer(tlsOptions, (req, res) => {
+const server = http2.createSecureServer({ ...tlsOptions, allowHTTP1: true }, (req, res) => {
   const reqId = randomBytes(4).toString('hex');
   const start = Date.now();
 
