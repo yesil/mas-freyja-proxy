@@ -42,6 +42,17 @@ const BYPASS_CACHE_CONTROL = 'no-store';
 const SENSITIVE_HEADER_KEYS = new Set(['authorization', 'proxy-authorization']);
 const OMIT_FROM_LOG = new Set(['cookie', 'set-cookie']);
 
+// CORS headers injected on every response so the browser sees upstream errors
+// instead of a generic CORS wall. Using '*' because the proxy strips cookies
+// and never forwards credentials — so credentialed CORS isn't in play.
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS',
+  'Access-Control-Allow-Headers': '*',
+  'Access-Control-Expose-Headers': '*',
+  'Access-Control-Max-Age': '600',
+};
+
 function redactHeaders(headers) {
   const out = {};
   for (const [k, v] of Object.entries(headers || {})) {
@@ -232,16 +243,21 @@ async function handleRequest(reqId, req, res, mode) {
     const is2xx = proxyRes.statusCode >= 200 && proxyRes.statusCode < 300;
     const cacheControl = mode === 'stage' && is2xx ? STAGE_CACHE_CONTROL : BYPASS_CACHE_CONTROL;
     const outHeaders = dropHeaders(stripResponseCookies(proxyRes.headers), [
-      'cache-control', ...HOP_BY_HOP,
+      'cache-control',
+      'access-control-allow-origin', 'access-control-allow-methods',
+      'access-control-allow-headers', 'access-control-expose-headers',
+      'access-control-max-age', 'access-control-allow-credentials',
+      ...HOP_BY_HOP,
     ]);
     outHeaders['Cache-Control'] = cacheControl;
+    Object.assign(outHeaders, CORS_HEADERS);
     res.writeHead(proxyRes.statusCode, outHeaders);
     proxyRes.pipe(res);
   });
 
   proxyReq.on('error', (err) => {
     log('error', 'upstream request error', { reqId, message: err.message });
-    if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' });
+    if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain', ...CORS_HEADERS });
     res.end('Bad Gateway');
   });
 
@@ -250,7 +266,7 @@ async function handleRequest(reqId, req, res, mode) {
 
 function onHandlerError(reqId, res, err) {
   log('error', 'handler error', { reqId, message: err.message });
-  if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' });
+  if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain', ...CORS_HEADERS });
   res.end('Bad Gateway');
 }
 
@@ -273,7 +289,16 @@ const server = http2.createSecureServer({ ...tlsOptions, allowHTTP1: true }, (re
 
   if (req.url === '/favicon.ico') {
     log('debug', 'favicon short-circuit', { reqId });
-    res.writeHead(204);
+    res.writeHead(204, CORS_HEADERS);
+    res.end();
+    return;
+  }
+
+  // CORS preflight: answer directly so a 404 from upstream on OPTIONS can't
+  // strip our CORS headers and break the browser's preflight check.
+  if (req.method === 'OPTIONS') {
+    log('debug', 'preflight short-circuit', { reqId });
+    res.writeHead(204, { ...CORS_HEADERS, 'Content-Length': '0' });
     res.end();
     return;
   }
