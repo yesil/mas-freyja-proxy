@@ -8,7 +8,6 @@ const TARGET = new URL('https://preview-p22655-e59433.adobeaemcloud.com/');
 const PORT = process.env.PORT || 3000;
 const SSL_CERT = process.env.SSL_CERT;
 const SSL_KEY = process.env.SSL_KEY;
-const ACCESS_TOKEN = process.env.ACCESS_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const CLIENT_SECRET = process.env.CLIENT_SECRET;
 const SCOPES = process.env.SCOPES;
@@ -20,13 +19,24 @@ if (!SSL_CERT || !SSL_KEY) {
   console.error('SSL_CERT and SSL_KEY environment variables are required (paths to PEM files)');
   process.exit(1);
 }
-if (!ACCESS_TOKEN && (!CLIENT_ID || !CLIENT_SECRET || !SCOPES)) {
-  console.error('Provide ACCESS_TOKEN, or CLIENT_ID + CLIENT_SECRET + SCOPES for OAuth mint');
+if (!CLIENT_ID || !CLIENT_SECRET || !SCOPES) {
+  console.error('CLIENT_ID, CLIENT_SECRET and SCOPES are required for IMS S2S token mint');
   process.exit(1);
 }
 
 const LEVELS = { error: 0, warn: 1, info: 2, debug: 3 };
 const ACTIVE_LEVEL = LEVELS[LOG_LEVEL] ?? LEVELS.debug;
+
+// Downstream Cache-Control policy: the browser is the real cache.
+// - Short max-age: freshness commitment.
+// - Long stale-while-revalidate: near-instant perceived latency; the browser
+//   serves the stale body immediately and revalidates in the background.
+// - stale-if-error: keep serving stale briefly if upstream blips.
+// Browser revalidation is cheap because ETag / Last-Modified pass through
+// unchanged, so background refreshes are usually 304s.
+const STAGE_CACHE_CONTROL =
+  'public, max-age=15, stale-while-revalidate=604800, stale-if-error=604800';
+const BYPASS_CACHE_CONTROL = 'no-store';
 
 const SENSITIVE_HEADER_KEYS = new Set(['authorization', 'proxy-authorization']);
 const OMIT_FROM_LOG = new Set(['cookie', 'set-cookie']);
@@ -50,8 +60,6 @@ function stripResponseCookies(headers) {
   return out;
 }
 
-// Remove any upstream-provided values for headers we set ourselves,
-// so we don't emit duplicates (e.g. AEM sends its own `x-cache`).
 function dropHeaders(headers, names) {
   const drop = new Set(names.map((n) => n.toLowerCase()));
   const out = {};
@@ -98,19 +106,33 @@ const tlsOptions = {
   key: fs.readFileSync(SSL_KEY),
 };
 
+// Persistent TCP+TLS pool to upstream. Critical now that the browser does
+// most caching: every browser SWR revalidation still traverses the proxy,
+// and paying a handshake per 304 would dominate latency.
+const upstreamAgent = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 30_000,
+  maxSockets: 64,
+});
+
 const HOP_BY_HOP = new Set([
   'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
   'te', 'trailer', 'transfer-encoding', 'upgrade', 'host',
 ]);
 
-// Headers from the incoming client request that must NOT be forwarded upstream.
-// - `cookie` / `authorization`: scoped to this proxy's hostname; useless (and large) for AEM,
-//   and we set our own Authorization below.
-// - `sec-ch-*` / `sec-fetch-*` / `upgrade-insecure-requests` / `dnt` / `priority`:
-//   browser fetch metadata irrelevant to AEM and contributing header bloat that causes 431.
-// - `referer` / `origin`: reference this proxy, not upstream; safer to drop.
+// Headers from the incoming client request that must NOT be forwarded upstream:
+//  - cookie / authorization: scoped to this proxy, useless (and large) to AEM;
+//    we set our own Authorization below.
+//  - cache-control / pragma: a mode signal for this proxy, not a directive
+//    for AEM; AEM should decide caching on its own.
+//  - sec-ch-* / sec-fetch-* / upgrade-insecure-requests / dnt / priority:
+//    browser fetch metadata AEM doesn't use and that causes HTTP 431.
+//  - referer / origin: point at this proxy, not upstream.
+// Note: If-None-Match / If-Modified-Since are intentionally *not* dropped —
+// they're the browser's conditional revalidation and must flow through.
 const DROP_FROM_UPSTREAM = new Set([
   'cookie', 'authorization',
+  'cache-control', 'pragma',
   'referer', 'origin',
   'upgrade-insecure-requests', 'dnt', 'priority',
   'sec-ch-ua', 'sec-ch-ua-mobile', 'sec-ch-ua-platform', 'sec-ch-ua-arch',
@@ -119,10 +141,7 @@ const DROP_FROM_UPSTREAM = new Set([
   'sec-fetch-dest', 'sec-fetch-mode', 'sec-fetch-site', 'sec-fetch-user',
 ]);
 
-const MAX_ENTRIES = 500;
-const MAX_TTL_SEC = 300;
 const REFRESH_SKEW_MS = 5 * 60 * 1000;
-const cache = new Map();
 
 let tokenCache = null;
 let tokenInFlight = null;
@@ -154,7 +173,6 @@ async function mintToken() {
 }
 
 async function getToken() {
-  if (ACCESS_TOKEN) return ACCESS_TOKEN;
   if (tokenCache && tokenCache.expiresAt > Date.now()) return tokenCache.token;
   if (!tokenInFlight) {
     log('debug', 'token cache miss, minting');
@@ -172,7 +190,7 @@ function parseMaxAge(headerValue) {
   if (!match) return 0;
   const n = parseInt(match[1], 10);
   if (!Number.isFinite(n) || n <= 0) return 0;
-  return Math.min(n, MAX_TTL_SEC);
+  return n;
 }
 
 async function buildUpstreamHeaders(req) {
@@ -187,54 +205,10 @@ async function buildUpstreamHeaders(req) {
   return headers;
 }
 
-function sanitizeCachedHeaders(src) {
-  const out = {};
-  for (const [k, v] of Object.entries(src)) {
-    const lk = k.toLowerCase();
-    if (HOP_BY_HOP.has(lk)) continue;
-    if (lk === 'set-cookie' || lk === 'content-length') continue;
-    out[k] = v;
-  }
-  return out;
-}
-
-function serveFromCache(res, entry) {
-  const headers = { ...entry.headers, 'X-Cache': 'HIT', 'Content-Length': entry.body.length };
-  res.writeHead(entry.status, headers);
-  res.end(entry.body);
-}
-
-function storeInCache(key, entry) {
-  if (cache.size >= MAX_ENTRIES) {
-    const oldest = cache.keys().next().value;
-    if (oldest !== undefined) {
-      cache.delete(oldest);
-      log('debug', 'cache evict', { evicted: oldest, size: cache.size });
-    }
-  }
-  cache.set(key, entry);
-}
-
-async function handleCacheable(reqId, req, res, ttlSec) {
-  const key = `${req.method} ${req.url}`;
-  const now = Date.now();
-  const existing = cache.get(key);
-  if (existing && existing.expiresAt > now) {
-    const ageMs = now - (existing.expiresAt - ttlSec * 1000);
-    log('info', 'cache hit', { reqId, key, ageMs, bytes: existing.body.length });
-    serveFromCache(res, existing);
-    return;
-  }
-  if (existing) {
-    log('debug', 'cache expired', { reqId, key });
-    cache.delete(key);
-  } else {
-    log('debug', 'cache miss', { reqId, key });
-  }
-
+async function handleRequest(reqId, req, res, mode) {
   const headers = await buildUpstreamHeaders(req);
   const upstreamStart = Date.now();
-  log('debug', 'upstream request', { reqId, method: req.method, path: req.url, cacheable: true });
+  log('debug', 'upstream request', { reqId, method: req.method, path: req.url, mode });
   logCurl(reqId, req.method, req.url, headers);
 
   const proxyReq = https.request({
@@ -243,70 +217,20 @@ async function handleCacheable(reqId, req, res, ttlSec) {
     path: req.url,
     method: req.method,
     headers,
-  }, (proxyRes) => {
-    const status = proxyRes.statusCode;
-    const hasSetCookie = Boolean(proxyRes.headers['set-cookie']);
-    const cacheable = status >= 200 && status < 300;
-    log('info', 'upstream response', {
-      reqId, status, durationMs: Date.now() - upstreamStart,
-      contentLength: proxyRes.headers['content-length'], cacheable, hasSetCookie,
-    });
-
-    if (!cacheable) {
-      res.writeHead(status, { ...dropHeaders(stripResponseCookies(proxyRes.headers), ['x-cache']), 'X-Cache': 'MISS' });
-      proxyRes.pipe(res);
-      return;
-    }
-
-    const chunks = [];
-    proxyRes.on('data', (chunk) => chunks.push(chunk));
-    proxyRes.on('end', () => {
-      const body = Buffer.concat(chunks);
-      const cachedHeaders = dropHeaders(sanitizeCachedHeaders(proxyRes.headers), ['x-cache']);
-      storeInCache(key, {
-        expiresAt: Date.now() + ttlSec * 1000,
-        status,
-        headers: cachedHeaders,
-        body,
-      });
-      log('info', 'cache store', { reqId, key, ttlSec, bytes: body.length, size: cache.size });
-      res.writeHead(status, { ...cachedHeaders, 'X-Cache': 'MISS', 'Content-Length': body.length });
-      res.end(body);
-    });
-    proxyRes.on('error', (err) => {
-      log('error', 'upstream response error', { reqId, message: err.message });
-      if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' });
-      res.end('Bad Gateway');
-    });
-  });
-
-  proxyReq.on('error', (err) => {
-    log('error', 'upstream request error', { reqId, message: err.message });
-    if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' });
-    res.end('Bad Gateway');
-  });
-
-  req.pipe(proxyReq);
-}
-
-async function handleBypass(reqId, req, res) {
-  const headers = await buildUpstreamHeaders(req);
-  const upstreamStart = Date.now();
-  log('debug', 'upstream request', { reqId, method: req.method, path: req.url, cacheable: false });
-  logCurl(reqId, req.method, req.url, headers);
-
-  const proxyReq = https.request({
-    hostname: TARGET.hostname,
-    port: TARGET.port || 443,
-    path: req.url,
-    method: req.method,
-    headers,
+    agent: upstreamAgent,
   }, (proxyRes) => {
     log('info', 'upstream response', {
-      reqId, status: proxyRes.statusCode, durationMs: Date.now() - upstreamStart,
-      contentLength: proxyRes.headers['content-length'], cacheable: false,
+      reqId, status: proxyRes.statusCode,
+      durationMs: Date.now() - upstreamStart,
+      contentLength: proxyRes.headers['content-length'], mode,
     });
-    res.writeHead(proxyRes.statusCode, { ...dropHeaders(stripResponseCookies(proxyRes.headers), ['x-cache']), 'X-Cache': 'BYPASS' });
+    // Override upstream Cache-Control: the proxy, not AEM, decides what the
+    // browser should do with these responses. ETag / Last-Modified pass
+    // through unchanged so browser conditional revalidation keeps working.
+    const cacheControl = mode === 'stage' ? STAGE_CACHE_CONTROL : BYPASS_CACHE_CONTROL;
+    const outHeaders = dropHeaders(stripResponseCookies(proxyRes.headers), ['cache-control']);
+    outHeaders['Cache-Control'] = cacheControl;
+    res.writeHead(proxyRes.statusCode, outHeaders);
     proxyRes.pipe(res);
   });
 
@@ -327,18 +251,15 @@ function onHandlerError(reqId, res, err) {
 
 log('info', 'starting', {
   target: TARGET.origin, port: PORT, sslCert: SSL_CERT, sslKey: SSL_KEY,
-  tokenMode: ACCESS_TOKEN ? 'static' : 'oauth',
-  tokenEndpoint: ACCESS_TOKEN ? undefined : TOKEN_ENDPOINT,
-  logLevel: LOG_LEVEL, maxCacheEntries: MAX_ENTRIES, maxTtlSec: MAX_TTL_SEC,
+  tokenEndpoint: TOKEN_ENDPOINT, logLevel: LOG_LEVEL,
+  stageCacheControl: STAGE_CACHE_CONTROL, bypassCacheControl: BYPASS_CACHE_CONTROL,
 });
 
-if (!ACCESS_TOKEN) {
-  try {
-    await getToken();
-  } catch (err) {
-    log('error', 'initial token mint failed, exiting', { message: err.message });
-    process.exit(1);
-  }
+try {
+  await getToken();
+} catch (err) {
+  log('error', 'initial token mint failed, exiting', { message: err.message });
+  process.exit(1);
 }
 
 const server = https.createServer(tlsOptions, (req, res) => {
@@ -347,29 +268,30 @@ const server = https.createServer(tlsOptions, (req, res) => {
 
   if (req.url === '/favicon.ico') {
     log('debug', 'favicon short-circuit', { reqId });
-    res.writeHead(204, { 'X-Cache': 'STUB' });
+    res.writeHead(204);
     res.end();
     return;
   }
 
-  const ttlSec = parseMaxAge(req.headers['cache-control']);
-  const useCache = (req.method === 'GET' || req.method === 'HEAD') && ttlSec > 0;
+  // Mode selection: stage callers opt in by sending Cache-Control: max-age>0
+  // on the request. Anything else (including non-GET/HEAD) is authoring.
+  const reqMaxAge = parseMaxAge(req.headers['cache-control']);
+  const mode = (req.method === 'GET' || req.method === 'HEAD') && reqMaxAge > 0
+    ? 'stage' : 'bypass';
 
   log('info', 'request', {
     reqId, method: req.method, url: req.url,
-    remote: req.socket.remoteAddress, route: useCache ? 'cache' : 'bypass', ttlSec,
+    remote: req.socket.remoteAddress, mode,
     headers: redactHeaders(req.headers),
   });
 
   res.on('finish', () => {
     log('info', 'response', {
-      reqId, status: res.statusCode,
-      xCache: res.getHeader('X-Cache'), durationMs: Date.now() - start,
+      reqId, status: res.statusCode, durationMs: Date.now() - start,
     });
   });
 
-  const promise = useCache ? handleCacheable(reqId, req, res, ttlSec) : handleBypass(reqId, req, res);
-  promise.catch((err) => onHandlerError(reqId, res, err));
+  handleRequest(reqId, req, res, mode).catch((err) => onHandlerError(reqId, res, err));
 });
 
 server.listen(PORT, () => {
